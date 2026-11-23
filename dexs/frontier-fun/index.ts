@@ -73,6 +73,9 @@ const FACTORY_HOOKS = [
   "0xb31780AAd49D3Cc7Dd6E03E9e462606F0A5A30Cc",
   // gen-2, since 2026-08-28: https://robinhoodchain.blockscout.com/address/0xee588bCF2bd3e658f5160489f4199d1851BBf0Cc
   "0xee588bCF2bd3e658f5160489f4199d1851BBf0Cc",
+  // OpenHook (gen-3) has no entry here. Each OpenHook pool has its own hook, so no
+  // fixed address exists. The volume query takes those hooks from `openHookPoolHooks`,
+  // a list that readOpenHooks fills from HookCreated. It is empty until the deploy.
 ];
 // Receives the LP fees of the permanently locked seed positions when someone
 // calls Harvester.collect (permissionless) and splits them (FeesDistributed).
@@ -92,6 +95,39 @@ const POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951";
 const V4_SWAP_FEE_TOPIC = "0xf1a3d823f78e33cdd2d6f81c311b178dc348a2bab03c7afacea8326a1d98d41f";
 const V4_POL_FEE_TOPIC = "0x7b629ab4257c85bfc2373ab7f36e5f6cf7b8bf085b192d2938cebb7a3726eb87";
 
+// OpenHook is the third hook generation. It is NOT deployed. Each pool has its own
+// hook contract. One OpenHookFactory deploys every hook and emits HookCreated.
+// Every value below is empty on purpose. Each value comes from the deploy record
+// (CHANGELOG.md of frontier-contracts, the chore(deploy) commit). Do not guess one.
+// The adapter skips the hook part while the three required values are empty.
+const OPENHOOK_CONFIG = {
+  // Required. The OpenHookFactory address. It emits HookCreated for each hook.
+  hookFactory: "",
+  // Required. The deploy block of the OpenHookFactory. The HookCreated scan starts here.
+  startBlock: 0,
+  // Required. Each Frontier registrar: each LiquidityManagerV2 that creates Frontier
+  // pools. The hook factory is open, and a registrar declares the role of each
+  // recipient slot. The adapter trusts a role only for a hook of a registrar in this
+  // list. Add each new manager, never remove one.
+  registrars: [] as string[],
+  // Optional. The PolDistributorV2 address. Set it at the switch of Harvester.distributor,
+  // which can come before the first hook. After the switch the old PolDistributor event
+  // stops, for the gen-2 pools too. Empty skips the POL fees of this distributor.
+  polDistributorV2: "",
+};
+// Signatures from frontier-contracts abi/OpenHookFactory.json, abi/OpenHookFeeLib.json
+// and abi/PolDistributorV2.json at commit c04372e3 (PR #116, unreleased).
+// The contracts are not final. Compare these three lines with the deployed ABI.
+const HOOK_CREATED_EVENT =
+  "event HookCreated(address indexed hook, address indexed registrar, bytes32 indexed poolId, address coin, address quote, address referral)";
+const OPEN_SWAP_FEE_EVENT =
+  "event SwapFeeDistributed(bytes32 indexed poolId, address indexed currency, address indexed trader, uint256 feeAmount, uint256 protocolAmount, uint256 referralAmount, uint256 recipientAmount, uint256 authorAmount, uint8 traderSource, address[] payees, uint256[] payeeAmounts, uint8[] payeeRoles)";
+const POL_V2_FEES_EVENT =
+  "event FeesDistributed(uint256 indexed tokenId, address indexed coin, bytes32 indexed poolId, address[] recipients, uint256[] recipientWeth, uint256[] recipientCoin, uint256 protocolWeth, uint256 protocolCoin)";
+// The guidelines ask for `targets`, and allow a scan by topic0 with a filter on
+// the emitter for hundreds of targets. A launchpad passes this count quickly.
+const OPENHOOK_MAX_TARGETS = 200;
+
 const LABEL = {
   CurveTradeFees: "Curve Trade Fees",
   GraduationFees: "Graduation Fees",
@@ -109,6 +145,27 @@ const LABEL = {
   PolFeesToProtocol: "POL Fees to Protocol",
   PolFeesToStakers: "POL Fees to Stakers",
   PolFeesToCreators: "POL Fees to Creators",
+  PoolSwapFeesToRecipients: "Pool Swap Fees to Pool Recipients",
+  PoolSwapFeesToReferrers: "Pool Swap Fees to Referrers",
+  PoolSwapFeesToAuthors: "Pool Swap Fees to Extension Authors",
+  PolFeesToRecipients: "POL Fees to Pool Recipients",
+  PoolSwapFeesToBuybacks: "Pool Swap Fees to Coin Buybacks",
+  PoolSwapFeesToLotteries: "Pool Swap Fees to Lotteries",
+  PoolSwapFeesToSplitters: "Pool Swap Fees to Fee Splitters",
+};
+
+// Recipient.role of IOpenHook, as SwapFeeDistributed repeats it in payeeRoles:
+// 0 not declared, 1 creator, 2 staking, 3 buyback, 4 lottery, 5 splitter,
+// 6 the part of the registrar. Role 6 of a Frontier registrar is the Frontier slot.
+const OPENHOOK_FRONTIER_ROLE = 6;
+// A buyback slot buys the coin of the pool, not a token of the protocol. Frontier has
+// no token, so the amount is not holders revenue. It is a cost paid to the coin side.
+const OPENHOOK_ROLE_LABEL: Record<number, string> = {
+  1: LABEL.PoolSwapFeesToCreators,
+  2: LABEL.PoolSwapFeesToStakers,
+  3: LABEL.PoolSwapFeesToBuybacks,
+  4: LABEL.PoolSwapFeesToLotteries,
+  5: LABEL.PoolSwapFeesToSplitters,
 };
 
 const logIndexOf = (log: any) => Number(log.logIndex ?? log.index ?? 0);
@@ -303,7 +360,7 @@ const addV12 = async (options: FetchOptions, day: DayBalances) => {
   });
 };
 
-const addV4 = async (options: FetchOptions, day: DayBalances) => {
+const addV4 = async (options: FetchOptions, day: DayBalances, openHookPoolHooks: string[]) => {
   const { dailyVolume, dailyFees, dailyProtocolRevenue, dailySupplySideRevenue } = day;
   const dayStart = washDayStart(options);
 
@@ -317,7 +374,7 @@ const addV4 = async (options: FetchOptions, day: DayBalances) => {
       FROM uniswap_v4_multichain.poolmanager_evt_initialize
       WHERE chain = 'robinhood'
         AND contract_address = ${POOL_MANAGER}
-        AND LOWER(CAST(hooks AS VARCHAR)) IN (${FACTORY_HOOKS.map((hook) => `'${hook.toLowerCase()}'`).join(", ")})
+        AND LOWER(CAST(hooks AS VARCHAR)) IN (${[...FACTORY_HOOKS, ...openHookPoolHooks].map((hook) => `'${hook.toLowerCase()}'`).join(", ")})
     ),
     wash_ev AS (
       SELECT id, COUNT(*) AS trades, COUNT(DISTINCT evt_tx_from) AS eoas
@@ -494,6 +551,149 @@ const addV4 = async (options: FetchOptions, day: DayBalances) => {
   });
 };
 
+type OpenHooks = Map<string, { isFrontier: boolean; hasNativeQuote: boolean }>;
+
+// The hook factory is open: any account can ask for a hook. The factory is the
+// authority for the hook list. An event with the same signature from any other
+// contract is not counted.
+const readOpenHooks = async (options: FetchOptions): Promise<OpenHooks> => {
+  const hooks: OpenHooks = new Map();
+  const { hookFactory, startBlock } = OPENHOOK_CONFIG;
+  const registrars = new Set(OPENHOOK_CONFIG.registrars.map((account) => account.toLowerCase()));
+
+  const required = [hookFactory !== "", startBlock !== 0, registrars.size !== 0];
+  if (required.every((isSet) => !isSet)) return hooks;
+  if (!required.every((isSet) => isSet)) {
+    throw new Error(
+      "[frontier-fun] OPENHOOK_CONFIG is incomplete: set hookFactory, startBlock and registrars together"
+    );
+  }
+  if ((await options.getToBlock()) < startBlock) return hooks;
+
+  const created = await options.getLogs({
+    target: hookFactory,
+    eventAbi: HOOK_CREATED_EVENT,
+    fromBlock: startBlock,
+    cacheInCloud: true,
+  });
+  created.forEach((log: any) => {
+    hooks.set(String(log.hook).toLowerCase(), {
+      isFrontier: registrars.has(String(log.registrar).toLowerCase()),
+      hasNativeQuote: BigInt(log.quote) === 0n,
+    });
+  });
+  return hooks;
+};
+
+// OpenHook pools. The hook takes the non-LP part of the swap fee and pays it in the
+// same call. SwapFeeDistributed states the final amount of each party.
+//
+//   feeAmount        -> Fees. It is the whole non-LP fee of the leg.
+//   protocolAmount   -> ProtocolRevenue. The OpenFactory treasury received it. It holds
+//                       the protocol share of a third-party pool and each fallback leg.
+//   payeeAmounts[i]  -> Hook of a Frontier registrar: payeeRoles[i] decides.
+//                       Role 6 (the Frontier slot) -> ProtocolRevenue. On a Frontier pool
+//                       the protocol share is zero and the Frontier cut is this slot.
+//                       Role 1 creator, 2 staking, 3 buyback, 4 lottery, 5 splitter and
+//                       0 not declared -> SupplySideRevenue, one label for each role.
+//   payeeAmounts[i]  -> Hook of any other registrar: SupplySideRevenue, one label.
+//                       A role is a claim of the registrar, so the adapter ignores it.
+//   referralAmount   -> SupplySideRevenue. The referral contract received it for referrers.
+//   authorAmount     -> SupplySideRevenue. The author vault holds it for extension authors.
+//
+// The LP part of the fee never passes through the hook. The uniswap-v4 adapter
+// reports it. This adapter counts only the LP fees of the locked seed positions,
+// when PolDistributorV2 pays them (FeesDistributed).
+const addOpenHook = async (options: FetchOptions, day: DayBalances, openHooks: OpenHooks) => {
+  const { dailyFees, dailyProtocolRevenue, dailySupplySideRevenue } = day;
+  const { polDistributorV2 } = OPENHOOK_CONFIG;
+
+  // One collection gives one FeesDistributed event, from the distributor that ran it.
+  // The old event (POL_DISTRIBUTORS, read in addV4) and this event have different
+  // emitters and different topic0 values, so a day with both counts each collection once.
+  // The event carries no role, so the recipient part has one label.
+  if (polDistributorV2) {
+    const collections = await options.getLogs({
+      target: polDistributorV2,
+      eventAbi: POL_V2_FEES_EVENT,
+    });
+    collections.forEach((log: any) => {
+      const legs: [string, any[], bigint][] = [
+        [WETH, log.recipientWeth, BigInt(log.protocolWeth)],
+        [String(log.coin), log.recipientCoin, BigInt(log.protocolCoin)],
+      ];
+      legs.forEach(([token, amounts, protocol]) => {
+        const recipients = amounts.reduce((sum: bigint, amount: any) => sum + BigInt(amount), 0n);
+        if (recipients + protocol === 0n) return;
+        dailyFees.add(token, recipients + protocol, LABEL.PolFees);
+        if (protocol !== 0n) dailyProtocolRevenue.add(token, protocol, LABEL.PolFeesToProtocol);
+        if (recipients !== 0n) dailySupplySideRevenue.add(token, recipients, LABEL.PolFeesToRecipients);
+      });
+    });
+  }
+
+  if (!openHooks.size) return;
+
+  const targets = [...openHooks.keys()];
+  const feeLogs =
+    targets.length <= OPENHOOK_MAX_TARGETS
+      ? await options.getLogs({ targets, eventAbi: OPEN_SWAP_FEE_EVENT, onlyArgs: false })
+      : await options.getLogs({ noTarget: true, eventAbi: OPEN_SWAP_FEE_EVENT, onlyArgs: false });
+
+  feeLogs.forEach((log: any) => {
+    const hook = openHooks.get(String(log.address).toLowerCase());
+    if (!hook) return;
+    const args = log.args;
+    const currency = String(args.currency);
+    const fee = BigInt(args.feeAmount);
+    const protocol = BigInt(args.protocolAmount);
+    const referral = BigInt(args.referralAmount);
+    const recipient = BigInt(args.recipientAmount);
+    const author = BigInt(args.authorAmount);
+
+    // The contracts state the equalities of this function. A failure means that the
+    // event changed.
+    const unbalanced = () =>
+      new Error(
+        `[frontier-fun] SwapFeeDistributed of hook ${log.address} does not balance in tx ${log.transactionHash}`
+      );
+    if (
+      args.payeeRoles.length !== args.payeeAmounts.length ||
+      args.payees.length !== args.payeeAmounts.length
+    )
+      throw unbalanced();
+
+    let frontier = 0n;
+    let slotSum = 0n;
+    const supplySide: Record<string, bigint> = {};
+    args.payeeAmounts.forEach((value: any, slot: number) => {
+      const amount = BigInt(value);
+      slotSum += amount;
+      const role = Number(args.payeeRoles[slot]);
+      if (hook.isFrontier && role === OPENHOOK_FRONTIER_ROLE) {
+        frontier += amount;
+        return;
+      }
+      const label =
+        (hook.isFrontier && OPENHOOK_ROLE_LABEL[role]) || LABEL.PoolSwapFeesToRecipients;
+      supplySide[label] = (supplySide[label] ?? 0n) + amount;
+    });
+
+    if (slotSum !== recipient || protocol + referral + recipient + author !== fee)
+      throw unbalanced();
+
+    if (fee === 0n) return;
+    dailyFees.add(currency, fee, LABEL.PoolSwapFees);
+    if (protocol + frontier !== 0n)
+      dailyProtocolRevenue.add(currency, protocol + frontier, LABEL.PoolSwapFeesToProtocol);
+    Object.entries(supplySide).forEach(([label, amount]) => {
+      if (amount !== 0n) dailySupplySideRevenue.add(currency, amount, label);
+    });
+    if (referral !== 0n) dailySupplySideRevenue.add(currency, referral, LABEL.PoolSwapFeesToReferrers);
+    if (author !== 0n) dailySupplySideRevenue.add(currency, author, LABEL.PoolSwapFeesToAuthors);
+  });
+};
+
 const fetch = async (options: FetchOptions): Promise<FetchResultV2> => {
   const day: DayBalances = {
     dailyVolume: options.createBalances(),
@@ -504,7 +704,15 @@ const fetch = async (options: FetchOptions): Promise<FetchResultV2> => {
 
   await addV1(options, day);
   await addV12(options, day);
-  await addV4(options, day);
+  // The volume query measures the ETH leg and takes the coin as currency1. Both hold
+  // only for a native ETH quote, so a pool with another quote adds fees and no volume.
+  const openHooks = await readOpenHooks(options);
+  const openHookPoolHooks = [...openHooks]
+    .filter(([, hook]) => hook.hasNativeQuote)
+    .map(([address]) => address);
+
+  await addV4(options, day, openHookPoolHooks);
+  await addOpenHook(options, day, openHooks);
 
   const dailyRevenue = day.dailyProtocolRevenue.clone();
 
@@ -520,15 +728,15 @@ const fetch = async (options: FetchOptions): Promise<FetchResultV2> => {
 
 const methodology = {
   Volume:
-    "Gross ETH notional (fees included) of buys and sells executed on Frontier bonding curves (v1 and v1.2), taken directly from each shared BondingCurve contract's Buy/Sell events, plus the ETH leg of every swap on a Frontier Uniswap V4 pool (graduated curves and v1.2 direct-seed launches alike), read from the canonical PoolManager's Swap events and filtered to the pools registered on Frontier's FactoryHook, excluding wash trading by the same rule as the uniswap-v4 adapter (pools whose daily trades come from too few distinct addresses to be organic, unless the coin is a core asset or CoinGecko-listed). Those V4 swaps are also counted by the uniswap-v4 adapter on Robinhood Chain, which is why this adapter is flagged doublecounted.",
-  Fees: "The bonding-curve trade fee charged on every buy and sell (1.5% of the trade's cost at the time of writing), the fees a token pays out of the ETH it raised when its curve fills and seeds its Uniswap V4 pool, the FactoryHook fee taken on every swap of a Frontier V4 pool (a hook delta on top of the pool's LP fee, so not part of uniswap-v4's fees), and the LP fees of the protocol's permanently locked seed positions, counted on a realized basis when they are collected (Harvester.collect is permissionless, so a collection carries the fees accrued since the previous one and lands on the collection day, not the days they were earned). v1 reconstructs the trade fee from the on-chain txFee timeline and graduation payouts from WETH transfers; v1.2 reads everything exactly from CurveFeeDistributed, GraduationFeesPaid, SwapFeeDistributed and the PolDistributor's FeesDistributed.",
+    "Gross ETH notional (fees included) of buys and sells executed on Frontier bonding curves (v1 and v1.2), taken directly from each shared BondingCurve contract's Buy/Sell events, plus the ETH leg of every swap on a Frontier Uniswap V4 pool (graduated curves and v1.2 direct-seed launches alike), read from the canonical PoolManager's Swap events and filtered to the pools registered on Frontier's FactoryHook, excluding wash trading by the same rule as the uniswap-v4 adapter (pools whose daily trades come from too few distinct addresses to be organic, unless the coin is a core asset or CoinGecko-listed). Those V4 swaps are also counted by the uniswap-v4 adapter on Robinhood Chain, which is why this adapter is flagged doublecounted. An OpenHook pool (one hook contract per pool, listed by HookCreated of the OpenHookFactory) is counted by the same rule when its quote is native ETH.",
+  Fees: "The bonding-curve trade fee charged on every buy and sell (1.5% of the trade's cost at the time of writing), the fees a token pays out of the ETH it raised when its curve fills and seeds its Uniswap V4 pool, the FactoryHook fee taken on every swap of a Frontier V4 pool (a hook delta on top of the pool's LP fee, so not part of uniswap-v4's fees), and the LP fees of the protocol's permanently locked seed positions, counted on a realized basis when they are collected (Harvester.collect is permissionless, so a collection carries the fees accrued since the previous one and lands on the collection day, not the days they were earned). v1 reconstructs the trade fee from the on-chain txFee timeline and graduation payouts from WETH transfers; v1.2 reads everything exactly from CurveFeeDistributed, GraduationFeesPaid, SwapFeeDistributed and the PolDistributor's FeesDistributed. OpenHook pools (the third hook generation, one hook contract per pool) add the non-LP part of each swap fee, read from SwapFeeDistributed of each hook that the OpenHookFactory created, and the collected seed-position LP fees that PolDistributorV2 reports.",
   UserFees: "Same as Fees: every fee is paid by traders out of their trade or out of the ETH they raised.",
   Revenue:
     "Protocol revenue across both deployments: on v1, the protocol's 25% of the bonding-curve trade fee net of referrer rewards plus the factory owner's graduation share; on v1.2, the residual share of the trade fee after referrer and creator cuts (creator share owner-tunable via creatorShareBps), the protocol's graduation share, the protocol owner's share of the hook fee on every V4 swap, and the protocol's share of collected seed-position LP fees. Frontier has no protocol token, so there is no holders revenue and Revenue equals ProtocolRevenue.",
   ProtocolRevenue:
-    "v1: 25% of the curve trade fee net of referrer rewards, plus WETH sent to the factory owner at graduation. v1.2: residual share of the curve trade fee (50% at the time of writing, net of referrer rewards), its share of graduation payouts (0% at the time of writing), the protocol owner's share of the V4 hook fee (protocolFeeRatio, owner-tunable) and the protocol's share of collected seed-position LP fees.",
+    "v1: 25% of the curve trade fee net of referrer rewards, plus WETH sent to the factory owner at graduation. v1.2: residual share of the curve trade fee (50% at the time of writing, net of referrer rewards), its share of graduation payouts (0% at the time of writing), the protocol owner's share of the V4 hook fee (protocolFeeRatio, owner-tunable) and the protocol's share of collected seed-position LP fees. OpenHook pools: the amount paid to the protocol treasury (the protocol share of a third-party pool and each payout that a payee refused), the recipient slot of a Frontier pool that the Frontier registrar declares as its own part (slot role 6 in SwapFeeDistributed), and the protocol part of the collections of PolDistributorV2.",
   SupplySideRevenue:
-    "v1: the creator's 75% of every curve trade fee, referrer rewards, and the 5% graduation fee to the token creator. v1.2: the creator's share of every curve trade fee (50% at the time of writing), referrer rewards, the 5% graduation fee to the creator, the graduation refund to the caller (0% at the time of writing), and the after-protocol remainder of the V4 hook fee and of collected seed-position LP fees, split between the coin's staking vault and its fee recipient (the creator).",
+    "v1: the creator's 75% of every curve trade fee, referrer rewards, and the 5% graduation fee to the token creator. v1.2: the creator's share of every curve trade fee (50% at the time of writing), referrer rewards, the 5% graduation fee to the creator, the graduation refund to the caller (0% at the time of writing), and the after-protocol remainder of the V4 hook fee and of collected seed-position LP fees, split between the coin's staking vault and its fee recipient (the creator). OpenHook pools: the amounts paid to the other recipient slots of the pool (the creator, the staking leaf of the coin, a buyback, lottery or fee splitter contract of the coin, and each slot of a pool that another registrar created), to the referral contract and to the extension authors, and the recipient part of the collections of PolDistributorV2.",
 };
 
 const feesBreakdown = {
@@ -537,9 +745,9 @@ const feesBreakdown = {
   [LABEL.GraduationFees]:
     "Fees paid in WETH out of the ETH a token raised when its curve fills. v1 classifies WETH transfers to the creator (5%) and factory owner (0% at the time of writing); v1.2 uses GraduationFeesPaid (creator 5%, protocol 0%, caller refund 0% at the time of writing). The ETH that seeds the Uniswap V4 pool is liquidity, not a fee, and is excluded.",
   [LABEL.PoolSwapFees]:
-    "The FactoryHook's fee on every swap of a Frontier Uniswap V4 pool, from SwapFeeDistributed: a volatility-scaled hook delta charged on top of the pool's LP fee, in the swap's input currency (native ETH or the coin). The LP fee itself belongs to uniswap-v4 and is not counted here.",
+    "The FactoryHook's fee on every swap of a Frontier Uniswap V4 pool, from SwapFeeDistributed: a volatility-scaled hook delta charged on top of the pool's LP fee, in the swap's input currency (native ETH or the coin). The LP fee itself belongs to uniswap-v4 and is not counted here. On an OpenHook pool the hook takes the non-LP part of one total fee, and SwapFeeDistributed of the hook of the pool states it.",
   [LABEL.PolFees]:
-    "Uniswap V4 LP fees of the protocol's permanently locked seed positions, counted on a realized basis when Harvester.collect forwards them to the PolDistributor (FeesDistributed), in WETH and the coin. A collection carries everything accrued since the previous one, so these land on the collection day rather than the days they were earned. These are also LP fees in uniswap-v4's figures.",
+    "Uniswap V4 LP fees of the protocol's permanently locked seed positions, counted on a realized basis when Harvester.collect forwards them to the PolDistributor (FeesDistributed), in WETH and the coin. A collection carries everything accrued since the previous one, so these land on the collection day rather than the days they were earned. These are also LP fees in uniswap-v4's figures. PolDistributorV2 reports the same collections with its own FeesDistributed event.",
 };
 
 const protocolRevenueBreakdown = {
@@ -566,11 +774,25 @@ const breakdownMethodology = {
     [LABEL.GraduationToCaller]:
       "The v1.2 graduation refund paid to the caller who triggered graduation (0% at the time of writing).",
     [LABEL.PoolSwapFeesToStakers]:
-      "The coin's staking vault's share of the V4 hook fee, after the protocol's cut (communityFeeRatio, fixed per pool at launch).",
+      "The coin's staking vault's share of the V4 hook fee, after the protocol's cut (communityFeeRatio, fixed per pool at launch). OpenHook pools of a Frontier registrar: the amount paid to the recipient slot with the staking role.",
     [LABEL.PoolSwapFeesToCreators]:
-      "The coin's fee recipient's (creator's) share of the V4 hook fee, after the protocol's cut.",
+      "The coin's fee recipient's (creator's) share of the V4 hook fee, after the protocol's cut. OpenHook pools of a Frontier registrar: the amount paid to the recipient slot with the creator role.",
     [LABEL.PolFeesToStakers]: "The coin's staking vault's share of collected seed-position LP fees.",
     [LABEL.PolFeesToCreators]: "The coin creator's share of collected seed-position LP fees.",
+    [LABEL.PoolSwapFeesToRecipients]:
+      "OpenHook pools: the hook fee paid to a recipient slot with no declared role, and to each recipient slot of a pool that a registrar other than Frontier created. The slot role is a claim of the registrar, so it is not used for those pools.",
+    [LABEL.PoolSwapFeesToBuybacks]:
+      "OpenHook pools of a Frontier registrar: the hook fee paid to the recipient slot with the buyback role. The contract buys the coin of the pool. The coin is not a token of the protocol, so the amount is a cost and not holders revenue.",
+    [LABEL.PoolSwapFeesToLotteries]:
+      "OpenHook pools of a Frontier registrar: the hook fee paid to the recipient slot with the lottery role, the lottery contract of the coin of the pool.",
+    [LABEL.PoolSwapFeesToSplitters]:
+      "OpenHook pools of a Frontier registrar: the hook fee paid to the recipient slot with the splitter role, a contract that divides the amount between several accounts.",
+    [LABEL.PoolSwapFeesToReferrers]:
+      "OpenHook pools: the part of the hook fee that the referral contract received for the referrers of the trader. The recipient slots fund it.",
+    [LABEL.PoolSwapFeesToAuthors]:
+      "OpenHook pools: the part of the hook fee credited to the authors of the extensions bound to the pool.",
+    [LABEL.PolFeesToRecipients]:
+      "The part of collected seed-position LP fees that PolDistributorV2 pays to the recipients of the pool: the recipient slots of an OpenHook pool without the Frontier slot, or the creator and the staking vault of an older pool. The event carries no slot role, so this part has one label.",
   },
 };
 
